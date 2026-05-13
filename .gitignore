@@ -55,3 +55,8 @@ config_for_ppl/
 *.jsonl
 bench_recursive*/
 bench*/
+# Profiling artifacts
+*.sqlite
+*.nsys-rep
+*.ncu-rep
+runs/**/profiles/
