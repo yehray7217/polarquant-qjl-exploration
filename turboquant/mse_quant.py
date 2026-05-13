@@ -68,6 +68,30 @@ def get_2bit_centroids(
 
     return base / (float(d) ** 0.5)
 
+def get_1bit_centroids(
+    d: int,
+    device: str | torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    TurboQuant-style 1-bit centroids for normalized rotated vectors.
+
+    We use the symmetric 1-bit Lloyd-Max codebook under the
+    high-dimensional Gaussian-limit approximation:
+
+      [-sqrt(2/pi), +sqrt(2/pi)] / sqrt(d)
+
+    Numerically:
+      [-0.79788456, 0.79788456] / sqrt(d)
+    """
+    base = torch.tensor(
+        [-0.7978845608028654, 0.7978845608028654],
+        dtype=dtype,
+        device=device,
+    )
+
+    return base / (float(d) ** 0.5)
+
 
 # ============================================================
 # Random orthogonal rotation
@@ -285,3 +309,41 @@ def turboquant_mse_dequantize_2bit(
     x_hat = x_hat_rot @ rotation
 
     return x_hat
+
+def get_4bit_centroids(
+    d: int,
+    device: str | torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    TurboQuant-style 4-bit scalar centroids for normalized rotated vectors.
+
+    These are the symmetric 16-level Lloyd-Max centroids for a
+    standard normal coordinate distribution, scaled by 1/sqrt(d),
+    matching the same Gaussian-limit style used by the existing
+    1-bit / 2-bit MSE codebooks.
+    """
+    base = torch.tensor(
+        [
+            -2.73258957,
+            -2.06901723,
+            -1.61804639,
+            -1.25623120,
+            -0.94234046,
+            -0.65675912,
+            -0.38804830,
+            -0.12839503,
+             0.12839503,
+             0.38804830,
+             0.65675912,
+             0.94234046,
+             1.25623120,
+             1.61804639,
+             2.06901723,
+             2.73258957,
+        ],
+        dtype=dtype,
+        device=device,
+    )
+
+    return base / (float(d) ** 0.5)

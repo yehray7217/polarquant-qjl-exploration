@@ -52,6 +52,20 @@ torch::Tensor turboquant_mse_lut_score_transposed_cuda(
     torch::Tensor centroids
 );
 
+torch::Tensor turboquant_mse_lut_1bit_score_transposed_cuda(
+    torch::Tensor q_rot,
+    torch::Tensor packed_mse_sign_bits_t,
+    torch::Tensor mse_norms,
+    torch::Tensor centroids
+);
+
+torch::Tensor turboquant_mse_lut_4bit_score_transposed_cuda(
+    torch::Tensor q_rot,
+    torch::Tensor packed_indices_t,
+    torch::Tensor mse_norms,
+    torch::Tensor centroids
+);
+
 torch::Tensor turboquant_decode_score(
     torch::Tensor q_rot,
     torch::Tensor sq,
@@ -178,5 +192,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "turboquant_mse_lut_score_transposed",
         &turboquant_mse_lut_score_transposed_cuda,
         "TurboQuant 2-bit MSE-only LUT fused score CUDA"
+    );
+
+    m.def(
+        "turboquant_mse_lut_1bit_score_transposed",
+        &turboquant_mse_lut_1bit_score_transposed_cuda,
+        "TurboQuant 1-bit MSE-only LUT fused score CUDA"
+    );
+
+    m.def(
+        "turboquant_mse_lut_4bit_score_transposed",
+        &turboquant_mse_lut_4bit_score_transposed_cuda,
+        "TurboQuant 4-bit MSE-only LUT fused score CUDA"
     );
 }
