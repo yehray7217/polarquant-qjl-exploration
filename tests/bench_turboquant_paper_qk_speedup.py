@@ -29,6 +29,9 @@ from turboquant.cuda_score_transposed import (
     turboquant_decode_score_transposed_cuda,
     turboquant_decode_score_transposed_sharedq_cuda,
 )
+from turboquant.cuda_score_mse_lut import (
+    turboquant_mse_lut_score_transposed_cuda,
+)
 
 from contextlib import contextmanager
 
@@ -279,6 +282,17 @@ def benchmark_one_length(
             qjl_residual_norms=qjl_norms,
             centroids=centroids,
         )
+        
+    def tq_score_mse_lut():
+        q_flat = q_fp32.squeeze(2)
+        q_rot = q_flat @ rotation.T
+
+        return turboquant_mse_lut_score_transposed_cuda(
+            q_rot=q_rot,
+            packed_mse_indices_t=packed_mse_t,
+            mse_norms=mse_norms,
+            centroids=centroids,
+        )
 
     with nvtx_range(f"paper_dense_einsum_T{T}"):
         dense_ms = cuda_time_ms(
@@ -303,14 +317,22 @@ def benchmark_one_length(
             warmup=warmup,
             iters=iters,
         )
+        tq_mse_lut_ms = cuda_time_ms(
+            tq_score_mse_lut,
+            warmup=warmup,
+            iters=iters,
+        )
 
     speedup_current = dense_ms / tq_ms
     speedup_transposed = dense_ms / tq_transposed_ms
     speedup_transposed_sharedq = dense_ms / tq_transposed_sharedq_ms
+    speedup_mse_lut = dense_ms / tq_mse_lut_ms
 
     transposed_over_current = tq_ms / tq_transposed_ms
     sharedq_over_current = tq_ms / tq_transposed_sharedq_ms
     sharedq_over_transposed = tq_transposed_ms / tq_transposed_sharedq_ms
+    mse_lut_over_current = tq_ms / tq_mse_lut_ms
+    mse_lut_over_sharedq = tq_transposed_sharedq_ms / tq_mse_lut_ms
 
     layer_report = cache.report()["layers"][0]
 
@@ -333,6 +355,7 @@ def benchmark_one_length(
             "turboquant_transposed_sharedq_score_ms": float(
                 tq_transposed_sharedq_ms
             ),
+            "turboquant_mse_lut_score_ms": float(tq_mse_lut_ms),
         },
         "speedup_over_einsum": {
             "current_packed_layout": float(speedup_current),
@@ -340,11 +363,14 @@ def benchmark_one_length(
             "transposed_sharedq_packed_layout": float(
                 speedup_transposed_sharedq
             ),
+            "mse_lut_packed_layout": float(speedup_mse_lut),
         },
         "layout_speedup": {
             "transposed_over_current": float(transposed_over_current),
             "sharedq_over_current": float(sharedq_over_current),
             "sharedq_over_transposed": float(sharedq_over_transposed),
+            "mse_lut_over_current": float(mse_lut_over_current),
+            "mse_lut_over_sharedq": float(mse_lut_over_sharedq),
         },
         "memory_bytes": {
             "dense_fp16_k_bytes": int(dense_k_bytes),
@@ -373,6 +399,9 @@ def benchmark_one_length(
         f"TQ transposed shared-q:    {tq_transposed_sharedq_ms:.6f} ms"
     )
     print(
+        f"TQ 2-bit MSE LUT:          {tq_mse_lut_ms:.6f} ms"
+    )
+    print(
         f"speedup current:           {speedup_current:.4f}x"
     )
     print(
@@ -382,6 +411,9 @@ def benchmark_one_length(
         f"speedup shared-q:          {speedup_transposed_sharedq:.4f}x"
     )
     print(
+        f"speedup MSE LUT:           {speedup_mse_lut:.4f}x"
+    )
+    print(
         f"transposed/current:        {transposed_over_current:.4f}x"
     )
     print(
@@ -389,6 +421,12 @@ def benchmark_one_length(
     )
     print(
         f"shared-q/transposed:       {sharedq_over_transposed:.4f}x"
+    )
+    print(
+        f"MSE LUT/current:           {mse_lut_over_current:.4f}x"
+    )
+    print(
+        f"MSE LUT/shared-q:          {mse_lut_over_sharedq:.4f}x"
     )
     print(
         f"dense K bytes:  {dense_k_bytes:,}"

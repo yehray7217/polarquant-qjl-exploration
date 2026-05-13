@@ -45,6 +45,13 @@ torch::Tensor turboquant_decode_score_transposed_sharedq_cuda(
     torch::Tensor centroids
 );
 
+torch::Tensor turboquant_mse_lut_score_transposed_cuda(
+    torch::Tensor q_rot,
+    torch::Tensor packed_mse_indices_t,
+    torch::Tensor mse_norms,
+    torch::Tensor centroids
+);
+
 torch::Tensor turboquant_decode_score(
     torch::Tensor q_rot,
     torch::Tensor sq,
@@ -165,5 +172,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "turboquant_decode_score_transposed_sharedq",
         &turboquant_decode_score_transposed_sharedq_cuda,
         "TurboQuant transposed decode score CUDA with shared-memory staged query vectors"
+    );
+
+    m.def(
+        "turboquant_mse_lut_score_transposed",
+        &turboquant_mse_lut_score_transposed_cuda,
+        "TurboQuant 2-bit MSE-only LUT fused score CUDA"
     );
 }

@@ -12,6 +12,7 @@ setup(
                 "turboquant/csrc/turboquant_pack_cuda.cu",
                 "turboquant/csrc/turboquant_mse_cuda.cu",
                 "turboquant/csrc/turboquant_score_transposed_cuda.cu",
+                "turboquant/csrc/turboquant_score_mse_lut_cuda.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
