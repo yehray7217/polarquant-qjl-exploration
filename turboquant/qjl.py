@@ -1,119 +1,106 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from contextlib import contextmanager
-from typing import Optional
-
 import math
+
 import torch
 
+from turboquant.qjl_packing import (
+    pack_qjl_signs_1bit,
+    unpack_qjl_signs_1bit,
+)
 
-# ============================================================
-# NVTX helper
-# ============================================================
+from turboquant.nvtx_utils import nvtx_range
 
-@contextmanager
-def _nvtx_range(name: str):
-    if torch.cuda.is_available():
-        torch.cuda.nvtx.range_push(name)
-        try:
-            yield
-        finally:
-            torch.cuda.nvtx.range_pop()
-    else:
-        yield
-
-
-# ============================================================
-# Encoding container
-# ============================================================
+QJL_CORRECTION_SCALE = 0.375
 
 @dataclass
 class QJLEncoding:
     """
-    QJL encoding for a batch of vectors.
+    Packed QJL residual representation.
 
-    sign_bits:
-        Sign sketch values in {-1,+1}, shape [N, M].
+    packed_sign_bits:
+        [N, M/8] uint8
+        Stores sign(S r_unit) using one bit per sketch coordinate.
 
     norms:
-        Original vector L2 norms, shape [N].
+        [N] float32
+        Original residual norms ||r||_2.
     """
-    sign_bits: torch.Tensor
+    packed_sign_bits: torch.Tensor
     norms: torch.Tensor
 
 
-# ============================================================
-# Gaussian sketch
-# ============================================================
-
 @torch.no_grad()
 def make_gaussian_sketch(
+    *,
     d: int,
     m: int,
     device: str | torch.device,
     dtype: torch.dtype = torch.float32,
-    seed: Optional[int] = None,
+    seed: int | None = None,
 ) -> torch.Tensor:
     """
-    Gaussian sketch matrix S with shape [M, D].
+    Build Gaussian JL sketch S with shape [M, D].
 
-    The estimator below assumes rows distributed approximately as N(0, I).
+    We use:
+        S_ij ~ N(0, 1/M)
+
+    so:
+        S = randn(M, D) / sqrt(M)
     """
-    device = torch.device(device)
+    if d <= 0:
+        raise ValueError(f"d must be positive, got {d}.")
 
-    if seed is None:
-        S = torch.randn(
-            m,
-            d,
-            dtype=dtype,
-            device=device,
-        )
-    else:
-        gen = torch.Generator(device=device)
-        gen.manual_seed(int(seed))
+    if m <= 0:
+        raise ValueError(f"m must be positive, got {m}.")
 
-        S = torch.randn(
-            m,
-            d,
-            dtype=dtype,
-            device=device,
-            generator=gen,
-        )
+    generator = None
+
+    if seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+
+    S = torch.randn(
+        m,
+        d,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+
+    S = S / math.sqrt(float(m))
 
     return S.contiguous()
 
 
-# ============================================================
-# QJL encode
-# ============================================================
-
 @torch.no_grad()
 def qjl_encode(
+    *,
     x: torch.Tensor,
     S: torch.Tensor,
+    max_chunk_rows: int = 262_144,
 ) -> QJLEncoding:
     """
-    Encode x with 1-bit sign sketches.
+    Encode residual vectors with QJL using chunked projection.
 
-    Input:
-      x:
-        [N, D]
+    Args:
+        x:
+            [N, D]
 
-      S:
-        [M, D]
+        S:
+            [M, D]
 
-    Output:
-      QJLEncoding(
-          sign_bits=[N, M] in {-1,+1},
-          norms=[N],
-      )
+        max_chunk_rows:
+            Number of vectors processed per chunk.
+            This prevents materializing a huge [N, M]
+            projected tensor for long-context K caches.
 
-    NVTX breakdown:
-      - tq_qjl_project
-      - tq_qjl_norm
-      - tq_qjl_sign
-      - tq_qjl_finalize
+    Returns:
+        QJLEncoding(
+            packed_sign_bits=[N, M/8],
+            norms=[N],
+        )
     """
     if x.ndim != 2:
         raise ValueError(
@@ -125,81 +112,141 @@ def qjl_encode(
             f"S must be [M,D], got shape={tuple(S.shape)}"
         )
 
-    D = x.shape[-1]
-
-    if S.shape[-1] != D:
+    if max_chunk_rows <= 0:
         raise ValueError(
-            f"sketch dimension mismatch: x D={D}, S={tuple(S.shape)}"
+            f"max_chunk_rows must be positive, got {max_chunk_rows}."
         )
 
-    with _nvtx_range("tq_qjl_project"):
-        x_fp = x.to(dtype=S.dtype)
-        projected = x_fp @ S.T
+    N, D = x.shape
+    M, D_s = S.shape
 
-    with _nvtx_range("tq_qjl_norm"):
-        norms = torch.linalg.vector_norm(
-            x_fp,
-            ord=2,
-            dim=-1,
+    if int(D) != int(D_s):
+        raise ValueError(
+            f"x.shape[-1]={D} does not match S.shape[-1]={D_s}."
         )
 
-    with _nvtx_range("tq_qjl_sign"):
-        sign_bits = torch.where(
-            projected >= 0,
-            torch.ones_like(projected),
-            -torch.ones_like(projected),
+    if int(M) % 8 != 0:
+        raise ValueError(
+            f"QJL sketch dimension M must be divisible by 8, got M={M}."
         )
 
-    with _nvtx_range("tq_qjl_finalize"):
-        sign_bits = sign_bits.contiguous()
-        norms = norms.contiguous()
-
-    return QJLEncoding(
-        sign_bits=sign_bits,
-        norms=norms,
+    x_f = (
+        x
+        if x.dtype == torch.float32
+        else x.to(torch.float32)
     )
 
+    S_f = S.to(
+        device=x.device,
+        dtype=torch.float32,
+    )
 
-# ============================================================
-# QJL inner-product estimator
-# ============================================================
+    # ------------------------------------------------------------
+    # Norms are only [N], cheap enough to compute globally.
+    # Store fp16 as before.
+    # ------------------------------------------------------------
+    norms_fp32 = torch.linalg.vector_norm(
+        x_f,
+        ord=2,
+        dim=-1,
+    )
+
+    safe_norms = torch.clamp(
+        norms_fp32,
+        min=torch.finfo(torch.float32).eps,
+    )
+
+    norms_store = norms_fp32.to(
+        torch.float16
+    ).contiguous()
+
+    # ------------------------------------------------------------
+    # Allocate final packed 1-bit signs once:
+    #   [N, M/8]
+    # ------------------------------------------------------------
+    packed_sign_bits = torch.empty(
+        int(N),
+        int(M // 8),
+        device=x.device,
+        dtype=torch.uint8,
+    )
+
+    # ------------------------------------------------------------
+    # Chunked QJL projection:
+    #
+    # For each chunk:
+    #   x_unit_chunk   [C,D]
+    #   projected      [C,M]
+    #   sign_bits      [C,M] bool
+    #   packed_signs   [C,M/8] uint8
+    # ------------------------------------------------------------
+    for start in range(
+        0,
+        int(N),
+        int(max_chunk_rows),
+    ):
+        end = min(
+            start + int(max_chunk_rows),
+            int(N),
+        )
+
+        x_chunk = x_f[start:end]
+        norm_chunk = safe_norms[start:end]
+
+        x_unit_chunk = x_chunk / norm_chunk.unsqueeze(-1)
+
+        projected_chunk = x_unit_chunk @ S_f.T
+
+        sign_bits_chunk = projected_chunk >= 0
+
+        packed_chunk = pack_qjl_signs_1bit(
+            sign_bits_chunk
+        )
+
+        packed_sign_bits[start:end].copy_(
+            packed_chunk
+        )
+
+        # Release large per-chunk temporaries eagerly.
+        del x_chunk
+        del norm_chunk
+        del x_unit_chunk
+        del projected_chunk
+        del sign_bits_chunk
+        del packed_chunk
+
+    return QJLEncoding(
+        packed_sign_bits=packed_sign_bits.contiguous(),
+        norms=norms_store,
+    )
 
 @torch.no_grad()
 def qjl_inner_product_estimate(
+    *,
     q: torch.Tensor,
     encoded_r: QJLEncoding,
     S: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Estimate <q, r> from:
-      - query vector q
-      - sign(S r)
-      - ||r||
+    Asymmetric QJL inner-product estimator.
 
-    Using the Gaussian identity:
-      E[ sign(<s,r>) * <s,q> ]
-        = sqrt(2/pi) * <q,r> / ||r||
+    Estimate:
+        <q, r>
 
-    Hence:
-      <q,r>
-        ≈ sqrt(pi/2) * ||r|| *
-          mean_j[ sign(<s_j,r>) * <s_j,q> ]
+    where only r is sign-quantized.
 
-    Input:
-      q:
-        [N, D]
+    Args:
+        q:
+            [N, D]
 
-      encoded_r.sign_bits:
-        [N, M]
+        encoded_r:
+            packed QJL encoding of residual r.
 
-      encoded_r.norms:
+        S:
+            [M, D]
+
+    Returns:
         [N]
-
-      S:
-        [M, D]
-
-    Output:
-      estimated dot products, shape [N]
     """
     if q.ndim != 2:
         raise ValueError(
@@ -214,39 +261,62 @@ def qjl_inner_product_estimate(
     N, D = q.shape
     M, D_s = S.shape
 
-    if D != D_s:
+    if int(D) != int(D_s):
         raise ValueError(
-            f"query/sketch dimension mismatch: q D={D}, S D={D_s}"
+            f"q.shape[-1]={D} does not match S.shape[-1]={D_s}."
         )
 
-    if encoded_r.sign_bits.shape != (N, M):
+    if encoded_r.norms.ndim != 1:
         raise ValueError(
-            f"encoded_r.sign_bits must be {(N, M)}, "
-            f"got {tuple(encoded_r.sign_bits.shape)}"
+            f"encoded_r.norms must be [N], got shape={tuple(encoded_r.norms.shape)}"
         )
 
-    if encoded_r.norms.shape != (N,):
+    if int(encoded_r.norms.shape[0]) != int(N):
         raise ValueError(
-            f"encoded_r.norms must be {(N,)}, "
-            f"got {tuple(encoded_r.norms.shape)}"
+            f"encoded_r.norms N mismatch: "
+            f"{encoded_r.norms.shape[0]} vs q N={N}"
         )
 
-    q_fp = q.to(dtype=S.dtype)
+    q_f = q.to(torch.float32)
+    S_f = S.to(torch.float32)
 
     # [N, M]
-    Sq = q_fp @ S.T
+    with nvtx_range("tq_qjl_project_q"):
+        q_projected = q_f @ S_f.T
 
-    # [N]
-    signed_mean = torch.mean(
-        Sq * encoded_r.sign_bits.to(dtype=Sq.dtype),
-        dim=-1,
-    )
+    # packed bits -> bool bits -> numeric ±1 signs
+    with nvtx_range("tq_qjl_unpack_signs"):
+        unpacked_bits = unpack_qjl_signs_1bit(
+            encoded_r.packed_sign_bits
+        )
 
-    # [N]
-    estimate = (
-        math.sqrt(math.pi / 2.0)
-        * encoded_r.norms.to(dtype=signed_mean.dtype)
-        * signed_mean
-    )
+    with nvtx_range("tq_qjl_bits_to_signs"):
+        residual_signs = torch.where(
+            unpacked_bits,
+            torch.ones_like(
+                unpacked_bits,
+                dtype=torch.float32,
+            ),
+            -torch.ones_like(
+                unpacked_bits,
+                dtype=torch.float32,
+            ),
+        )
 
-    return estimate
+    # Since S ~ N(0, 1/M), the unbiased asymmetric estimator is:
+    #
+    #   sqrt(pi/2) * ||r|| * sum_j [ (Sq)_j * sign((Sr)_j) ] / sqrt(M)
+    #
+    with nvtx_range("tq_qjl_reduce_estimate"):
+        correction = (
+            QJL_CORRECTION_SCALE
+            * math.sqrt(math.pi / 2.0)
+            * encoded_r.norms.to(torch.float32)
+            * torch.sum(
+                q_projected * residual_signs,
+                dim=-1,
+            )
+            / math.sqrt(float(M))
+        )
+
+    return correction.contiguous()
