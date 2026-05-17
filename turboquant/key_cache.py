@@ -449,12 +449,13 @@ class TurboQuantKeyCache:
             original_dim=D,
         )
 
-        qjl_sign_bits = unpack_sign_bits(
-            layer.packed_qjl_sign_bits,
-            original_dim=M,
-            return_pm_one=True,
-            dtype=self.sketch.dtype,
-        )
+        # Current QJLEncoding expects packed 1-bit signs, not unpacked {-1,+1}
+        # tensors. Keep the cache payload packed and let qjl_inner_product_estimate()
+        # perform the unpacking, matching the current QJL API.
+        packed_qjl_sign_bits = layer.packed_qjl_sign_bits.reshape(
+            B * H * T,
+            M // 8,
+        ).contiguous()
 
         return ProdEncoding(
             mse=MSEEncoding(
@@ -462,7 +463,7 @@ class TurboQuantKeyCache:
                 norms=layer.mse_norms.reshape(B * H * T),
             ),
             qjl_residual=QJLEncoding(
-                sign_bits=qjl_sign_bits.reshape(B * H * T, M),
+                packed_sign_bits=packed_qjl_sign_bits,
                 norms=layer.qjl_residual_norms.reshape(B * H * T),
             ),
         )
